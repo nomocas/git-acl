@@ -1,0 +1,104 @@
+#!/bin/bash
+
+GITUSER=${GITUSER:-git}
+GITHOME="/home/$GITUSER"
+SELF=`which $0`
+
+case "$1" in
+# Public commands
+
+  init) # sudo gitacl init
+    useradd -d $GITHOME -s /bin/bash $GITUSER || true
+    mkdir -p $GITHOME/.ssh
+    mkdir -p $GITHOME/acls
+    touch $GITHOME/.ssh/authorized_keys
+    chown -R $GITUSER $GITHOME
+    echo "Created receiver script in $GITHOME for user '$GITUSER'."
+    ;;
+
+  upload-key) # cat key | sudo gitacl upload-key <username> 
+    KEY=$(cat)
+    FINGERPRINT=$(ssh-keygen -lf /dev/stdin <<< $(echo $KEY) | awk '{print $2}')
+    AUTHORIZED_KEYS=$GITHOME/.ssh/authorized_keys
+    KEY_PREFIX="command=\"$SELF run $2 $FINGERPRINT\",no-agent-forwarding,no-pty,no-user-rc,no-X11-forwarding,no-port-forwarding"
+    sed '/$2/d' $AUTHORIZED_KEYS > $AUTHORIZED_KEYS # delete old line with user (for key change)
+    echo "$KEY_PREFIX $KEY" >> $AUTHORIZED_KEYS
+    #echo "$KEY_PREFIX $KEY"
+    echo $FINGERPRINT
+    # add here an ACL file for this user (if not exists) to store per projects rights
+    touch $GITHOME/acls/$2
+    ;;
+
+  allow) # sudo gitacl allow <username> <repo>
+    sed '/$3/d' $GITHOME/acls/$2 > $GITHOME/acls/$2 # delete old line with user (for key change)
+    echo "$3" >> $GITHOME/acls/$2
+    echo "$2 successfuly added to $3"
+    ;;
+
+
+# Internal commands
+  run)  ##  BE CAREFUL : no echo permitted here
+    export RECEIVE_USER=$2
+    export RECEIVE_FINGERPRINT=$3
+    eval $(echo $SSH_ORIGINAL_COMMAND | awk '{print "export RECEIVE_REPO="$2}')
+    REPO_PATH="$GITHOME/repositories/$RECEIVE_REPO"
+
+    # check here if user has rights to push or deploy (it find line with )
+    LINE=$(sed -n '/$RECEIVE_REPO/p' $GITHOME/acls/$2)
+
+    if [ '$LINE' -ne '$RECEIVE_REPO' ] 
+    then 
+      # no rights to push/deploy
+      echo "      ERROR: failed to push on $RECEIVE_REPO : push denied";
+      exit 1;
+    else 
+      if [ ! -d $REPO_PATH ]; 
+      then
+        mkdir -p $REPO_PATH
+        cd $REPO_PATH
+        git init --bare > /dev/null
+      fi
+
+      cd $GITHOME
+      HOOK="$REPO_PATH/hooks/post-receive"
+      cat > $HOOK <<EOF
+    #!/bin/bash
+    cat | $SELF deploy $RECEIVE_REPO
+EOF
+    cd ./repositories
+    eval "git-shell -c \"$SSH_ORIGINAL_COMMAND\""
+    fi
+    ;;
+  #________________________________________________________________ deploy
+  deploy)
+    while read oldrev newrev refname
+    do
+      
+      BRANCH=${refname#refs/heads/}
+      echo "GIT ACL : Update : has pushed to branch : $BRANCH. Trying deployement."
+
+      # if a configuration json for this branch exists in pushed-repo (under <repo_src>/conf/$BRANCH.json) : deploy should be done following this file
+
+      has_json=0
+      git rev-parse --verify $BRANCH:conf/$BRANCH.json 2>&1 && has_json=1
+      if [[ $has_json == 0 ]];
+      then
+              echo -e "\nno configuration json file found. exit without deploying\n"
+              exit 0 # no json founded : exit script normally
+      else
+              echo "\njson found : applying deployement\n"
+      fi
+
+      json=$(git show $BRANCH:conf/$BRANCH.json)
+      #echo "deploy was try for : $newrev ($BRANCH)" >> deploy-post-receive.txt
+
+      nvm use 0.10.2
+      deploy --conf "$json"  --branch $BRANCH --repository $2
+    done
+    #exit 1 # for debugging
+    ;;
+
+  help|*)
+    echo "Usage: gitacl <command> [options]"
+    ;;
+esac
